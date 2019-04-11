@@ -1,11 +1,48 @@
 
-Revision 0.3.4, released XX-09-2018
+Revision 0.4.5, released XX-01-2019
 -----------------------------------
 
+No changes so far
+
+Revision 0.4.4, released 30-12-2018
+-----------------------------------
+
+- Copyright notice bumped up to year 2019
+- Fixed pysnmp/pyasn1 debugging flags print out in `--help` to work
+  with newer pyasn1/pysnmp
+
+Revision 0.4.3, released 13-12-2018
+-----------------------------------
+
+- Default daemon syslog service destination to a local socket
+- Updated documentation on daemons command-line options
+- Added `snmpfwd`, `syslog` and `null` destinations to the `logger`
+  plugin, most parameters has been defaulted
+- Fixed timed log file rotation to respect log file creation time
+  when computing next rotation time
+- Fixed possible file permission issues by initializing logger
+  and plugin subsystems under reduced user privileges
+
+Revision 0.4.2, released 14-11-2018
+-----------------------------------
+
+- SNMP error logging improved
+- Fixed snmpfwd-server crash when multiple SNMP credentials are
+  configured for a single transport endpoint
+
+Revision 0.4.1, released 18-10-2018
+-----------------------------------
+
+- Added IPv6 support to SNMP engines built into snmpfwd server
+  and client effectively allowing IP version translation of the
+  SNMP traffic
+- Added IPv6 support to trunk connections
 - Missing *snmp-security-engine-id* option implemented
   in the server part to make SNMPv3 TRAP forwarding operational
 - Added SNMPv2c->SNMPv3 command forwarder example configuration
+- TRAP forwarding examples made more versatile
 - Bumped upper Python version to 3.7
+- Fixed v1->v2c TRAP PDU translation in snmpfwd server
 
 Revision 0.3.3, released 16-04-2018
 -----------------------------------

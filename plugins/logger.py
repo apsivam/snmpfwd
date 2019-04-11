@@ -1,7 +1,7 @@
 #
 # This file is part of snmpfwd software.
 #
-# Copyright (c) 2014-2018, Ilya Etingof <etingof@gmail.com>
+# Copyright (c) 2014-2019, Ilya Etingof <etingof@gmail.com>
 # License: http://snmplabs.com/snmpfwd/license.html
 #
 # SNMP Proxy Forwarder plugin module
@@ -10,14 +10,14 @@ import logging
 from logging import handlers
 import time
 import os
-import stat
+import socket
 try:
     from ConfigParser import RawConfigParser, Error
 except ImportError:
     from configparser import RawConfigParser, Error
 from snmpfwd.plugins import status
 from snmpfwd.error import SnmpfwdError
-from snmpfwd.log import debug, info, error
+from snmpfwd import log
 from pysnmp.proto.api import v2c
 
 hostProgs = 'snmpfwd-server', 'snmpfwd-client'
@@ -26,13 +26,47 @@ apiVersions = 0, 2
 
 PLUGIN_NAME = 'logger'
 
-# defaults
-pduMap = {}
-method = 'null'
-logFormat = ''
-leftParen, rightParen = '', ''
+DEFAULTS = {
+    # general
+    'method': 'snmpfwd',
+    'level': 'INFO',
 
+    # file
+    'rotation': 'timed',
+    'backupcount': 30,
+    'timescale': 'D',
+    'interval': 1,
+
+    # syslog
+    'transport': 'socket',
+    'facility': 'daemon',
+    'host': 'localhost',
+    'port': 514,
+
+    # content
+    'pdus': ('GetRequest GetNextRequest SetRequest '
+             'GetBulkRequest InformRequest SNMPv2Trap Response'),
+    'template': '${isotime} ${callflow-id} ${snmp-peer-address} '
+                '${snmp-pdu-type} ${snmp-var-binds}',
+    'parentheses': '" "'
+}
+
+SYSLOG_TRANSPORTS = {
+    'udp': socket.SOCK_DGRAM,
+    'tcp': socket.SOCK_STREAM
+}
+
+SYSLOG_SOCKET_PATHS = (
+    '/dev/log',
+    '/var/run/syslog'
+)
+
+PDU_MAP = {}
+
+# NOTE(etingof): this is a root logger
 logger = logging.getLogger('snmpfwd-logger')
+
+config = RawConfigParser(defaults=DEFAULTS)
 
 for moduleOption in moduleOptions:
 
@@ -42,69 +76,122 @@ for moduleOption in moduleOptions:
 
         configFile = optionValue
 
-        config = RawConfigParser()
         config.read(configFile)
 
-        method = config.get('general', 'method')
-        if method == 'file':
+method = config.get('general', 'method')
+if method == 'file':
 
-            rotation = config.get('file', 'rotation')
+    rotation = config.get('file', 'rotation')
 
-            if rotation == 'timed':
-                filename = config.get('file', 'destination')
+    if rotation == 'timed':
 
-                handler = handlers.TimedRotatingFileHandler(
-                    filename,
-                    config.get('file', 'timescale'),
-                    int(config.get('file', 'interval')),
-                    int(config.get('file', 'backupcount'))
-                )
+        filename = config.get('file', 'destination')
 
-                # Use file metadata change time instead of last modification
-                # time as the stock implementation does.
-                # This is to work-around the increasing rotation intervals
-                # on process restart.
-                # Warning: this is based on undocumented logger features.
-                if os.path.exists(filename):
-                    createdAt = os.stat(filename)[stat.ST_CTIME]
-                    handler.rolloverAt = handler.computeRollover(createdAt)
+        handler = log.FileLogger.TimedRotatingFileHandler(
+            filename,
+            config.get('file', 'timescale'),
+            int(config.get('file', 'interval')),
+            int(config.get('file', 'backupcount'))
+        )
 
-            else:
-                raise SnmpfwdError('%s: unknown rotation method %s at %s' % (PLUGIN_NAME, rotation, configFile))
+    else:
+        raise SnmpfwdError('%s: unknown rotation method %s' % (PLUGIN_NAME, rotation))
 
-        else:
-            raise SnmpfwdError('%s: unknown logging method %s at %s' % (PLUGIN_NAME, method, configFile))
+elif method == 'syslog':
 
-        debug('%s: using %s logging method' % (PLUGIN_NAME, method))
+    transport = config.get('syslog', 'transport')
 
-        logger.setLevel(logging.INFO)
+    if transport in SYSLOG_TRANSPORTS:
+        address = (
+            config.get('syslog', 'host'),
+            int(config.get('syslog', 'port'))
+        )
 
-        pdus = config.get('content', 'pdus')
-        for pdu in pdus.split():
-            try:
-                pduMap[getattr(v2c, pdu + 'PDU').tagSet] = pdu
+    else:
+        address = None
 
-            except AttributeError:
-                raise SnmpfwdError('%s: unknown PDU %s' % (PLUGIN_NAME, pdu))
+        for dev in SYSLOG_SOCKET_PATHS:
+            if os.path.exists(dev):
+                address = dev
+                transport = None
+                break
 
-            else:
-                debug('%s: PDU ACL includes %s' % (PLUGIN_NAME, pdu))
+        if transport and transport.startswith(os.path.sep):
+            address = transport
+            transport = None
 
-        try:
-            leftParen, rightParen = config.get('content', 'parentheses').split()
+        if not address:
+            raise SnmpfwdError('Unknown syslog transport configured')
 
-        except Exception:
-            error('%s: malformed "parentheses" values at %s' % (PLUGIN_NAME, configFile))
+    facility = config.get('syslog', 'facility').lower()
 
-        template = config.get('content', 'template')
+    handler = handlers.SysLogHandler(
+        address=address,
+        facility=facility,
+        socktype=transport)
 
-        debug('%s: using var-bind value parentheses %s %s' % (PLUGIN_NAME, leftParen, rightParen))
+elif method == 'snmpfwd':
 
-        logger.addHandler(handler)
+    class ProxyLogger(object):
+        """Just a mock to convey logging calls to snmpfwd log"""
+        error = log.error
+        info = log.info
+        debug = log.debug
+
+        def __str__(self):
+            return PLUGIN_NAME
+
+    handler = None
+    logger = ProxyLogger()
+
+elif method == 'null':
+    handler = logging.NullHandler()
+
+else:
+    raise SnmpfwdError('%s: unknown logging method %s' % (PLUGIN_NAME, method))
+
+if handler:
+    level = config.get('general', 'level').upper()
+
+    try:
+        level = getattr(logging, level)
+
+    except AttributeError:
+        raise SnmpfwdError('%s: unknown log level %s' % (PLUGIN_NAME, level))
+
+    handler.setLevel(level)
+
+    # set logger level if this is a root logger (i.e. separate from snmpfwd)
+    logger.setLevel(level)
+
+    logger.addHandler(handler)
+
+template = config.get('content', 'template')
+
+logger.debug('%s: using %s logging method' % (PLUGIN_NAME, method))
+
+pdus = config.get('content', 'pdus')
+for pdu in pdus.split():
+    try:
+        PDU_MAP[getattr(v2c, pdu + 'PDU').tagSet] = pdu
+
+    except AttributeError:
+        raise SnmpfwdError('%s: unknown PDU %s' % (PLUGIN_NAME, pdu))
+
+    else:
+        logger.debug('%s: PDU ACL includes %s' % (PLUGIN_NAME, pdu))
+
+try:
+    leftParen, rightParen = config.get('content', 'parentheses').split()
+
+except Exception:
+    raise SnmpfwdError('%s: malformed "parentheses" values' % PLUGIN_NAME)
+
+logger.debug('%s: using var-bind value parentheses %s %s' % (PLUGIN_NAME, leftParen, rightParen))
 
 started = time.time()
 
-info('%s: plugin initialization complete' % PLUGIN_NAME)
+logger.info('%s: plugin initialization complete' % PLUGIN_NAME)
 
 
 def _format(template, pdu, context):
@@ -124,7 +211,7 @@ def _format(template, pdu, context):
 
     token = '${snmp-pdu-type}'
     if token in template:
-        template = template.replace(token, pduMap[pdu.tagSet])
+        template = template.replace(token, PDU_MAP[pdu.tagSet])
 
     now = time.time()
 
@@ -153,10 +240,11 @@ def _format(template, pdu, context):
 
 
 def processCommandRequest(pluginId, snmpEngine, pdu, trunkMsg, reqCtx):
-    if pdu.tagSet in pduMap:
+    if pdu.tagSet in PDU_MAP:
         logger.info(_format(template, pdu, trunkMsg))
 
     return status.NEXT, pdu
+
 
 processCommandResponse = processCommandRequest
 

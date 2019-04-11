@@ -1,12 +1,14 @@
 #
 # This file is part of snmpfwd software.
 #
-# Copyright (c) 2014-2018, Ilya Etingof <etingof@gmail.com>
+# Copyright (c) 2014-2019, Ilya Etingof <etingof@gmail.com>
 # License: http://snmplabs.com/snmpfwd/license.html
 #
+import os
 import sys
 import logging
 import socket
+import stat
 import time
 from logging import handlers
 from snmpfwd.error import SnmpfwdError
@@ -31,13 +33,27 @@ class AbstractLogger(object):
 
 
 class SyslogLogger(AbstractLogger):
+    SYSLOG_SOCKET_PATHS = (
+        '/dev/log',
+        '/var/run/syslog'
+    )
+
     def init(self, *priv):
         if len(priv) < 1:
-            raise SnmpfwdError('Bad syslog params, need at least facility, also accept priority, host, port, socktype (tcp|udp)')
+            raise SnmpfwdError('Bad syslog params, need at least facility, also accept '
+                               'host, port, socktype (tcp|udp)')
         if len(priv) < 2:
             priv = [priv[0], 'debug']
         if len(priv) < 3:
-            priv = [priv[0], priv[1], 'localhost', 514, 'udp']
+            # search for syslog local socket
+
+            for dev in self.SYSLOG_SOCKET_PATHS:
+                if os.path.exists(dev):
+                    priv = [priv[0], priv[1], dev]
+                    break
+            else:
+                priv = [priv[0], priv[1], 'localhost', 514, 'udp']
+
         if not priv[2].startswith('/'):
             if len(priv) < 4:
                 priv = [priv[0], priv[1], priv[2], 514, 'udp']
@@ -46,7 +62,11 @@ class SyslogLogger(AbstractLogger):
             priv = [priv[0], priv[1], priv[2], int(priv[3]), priv[4]]
 
         try:
-            handler = handlers.SysLogHandler(priv[2].startswith('/') and priv[2] or (priv[2], int(priv[3])), priv[0].lower(), len(priv) > 4 and priv[4] == 'tcp' and socket.SOCK_STREAM or socket.SOCK_DGRAM)
+            handler = handlers.SysLogHandler(
+                address=priv[2].startswith('/') and priv[2] or (priv[2], int(priv[3])),
+                facility=priv[0].lower(),
+                socktype=len(priv) > 4 and priv[4] == 'tcp' and socket.SOCK_STREAM or socket.SOCK_DGRAM
+            )
 
         except Exception:
             raise SnmpfwdError('Bad syslog option(s): %s' % sys.exc_info()[1])
@@ -57,6 +77,57 @@ class SyslogLogger(AbstractLogger):
 
 
 class FileLogger(AbstractLogger):
+
+    class TimedRotatingFileHandler(handlers.TimedRotatingFileHandler):
+        """Store log creation time in a stand-alone file''s mtime"""
+
+        def __init__(self, *args, **kwargs):
+            handlers.TimedRotatingFileHandler.__init__(self, *args, **kwargs)
+
+            self.__failure = False
+
+            try:
+                timestamp = os.stat(self.__filename)[stat.ST_MTIME]
+
+            except IOError:
+                return
+
+            # Use a stand-aside file metadata time instead of the last
+            # modification of the log file itself, as the stock
+            # implementation does.
+            # This is to work-around the increasing rotation intervals
+            # on process restart.
+            self.rolloverAt = self.computeRollover(timestamp)
+
+        @property
+        def __filename(self):
+            return os.path.join(
+                os.path.dirname(self.baseFilename),
+                '.' + os.path.basename(self.baseFilename) + '-timestamp'
+            )
+
+        def doRollover(self):
+            try:
+                handlers.TimedRotatingFileHandler.doRollover(self)
+
+                # note log file creation time
+                if os.path.exists(self.__filename):
+                    os.unlink(self.__filename)
+
+                open(self.__filename, 'w').close()
+
+                self.__failure = False
+
+            except IOError:
+                # File rotation seems to fail, postpone the next run
+                timestamp = time.time()
+                self.rolloverAt = self.computeRollover(timestamp)
+
+                if not self.__failure:
+                    self.__failure = True
+                    error('Failed to rotate log/timestamp file '
+                          '%s: %s' % (self.__filename, sys.exc_info()[1]))
+
     def init(self, *priv):
         if not priv:
             raise SnmpfwdError('Bad log file params, need filename')
@@ -68,36 +139,41 @@ class FileLogger(AbstractLogger):
         maxsize = 0
         maxage = None
         if len(priv) > 1 and priv[1]:
-            if priv[1][-1] == 'k':
-                maxsize = int(priv[1][:-1]) * 1024
-            elif priv[1][-1] == 'm':
-                maxsize = int(priv[1][:-1]) * 1024 * 1024
-            elif priv[1][-1] == 'g':
-                maxsize = int(priv[1][:-1]) * 1024 * 1024 * 1024
-            elif priv[1][-1] == 'S':
-                maxage = ('S', int(priv[1][:-1]))
-            elif priv[1][-1] == 'M':
-                maxage = ('M', int(priv[1][:-1]))
-            elif priv[1][-1] == 'H':
-                maxage = ('H', int(priv[1][:-1]))
-            elif priv[1][-1] == 'D':
-                maxage = ('D', int(priv[1][:-1]))
-            else:
+            try:
+                if priv[1][-1] == 'k':
+                    maxsize = int(priv[1][:-1]) * 1024
+                elif priv[1][-1] == 'm':
+                    maxsize = int(priv[1][:-1]) * 1024 * 1024
+                elif priv[1][-1] == 'g':
+                    maxsize = int(priv[1][:-1]) * 1024 * 1024 * 1024
+                elif priv[1][-1] == 'S':
+                    maxage = ('S', int(priv[1][:-1]))
+                elif priv[1][-1] == 'M':
+                    maxage = ('M', int(priv[1][:-1]))
+                elif priv[1][-1] == 'H':
+                    maxage = ('H', int(priv[1][:-1]))
+                elif priv[1][-1] == 'D':
+                    maxage = ('D', int(priv[1][:-1]))
+                else:
+                    raise ValueError('Unknown log rotation criterion: %s' % priv[1][-1])
+
+            except ValueError:
                 raise SnmpfwdError(
-                    'Unknown log rotation criteria %s, use <NNN>k,m,g for size or <NNN>S,M,H,D for time limits' % priv[1]
+                    'Error in timed log rotation specification. Use <NNN>k,m,g '
+                    'for size or <NNN>S,M,H,D for time limits'
                 )
 
         try:
             if maxsize:
                 handler = handlers.RotatingFileHandler(priv[0], backupCount=30, maxBytes=maxsize)
             elif maxage:
-                handler = handlers.TimedRotatingFileHandler(priv[0], backupCount=30, when=maxage[0], interval=maxage[1])
+                handler = self.TimedRotatingFileHandler(priv[0], backupCount=30, when=maxage[0], interval=maxage[1])
             else:
                 handler = handlers.WatchedFileHandler(priv[0])
 
-        except AttributeError:
+        except Exception:
             raise SnmpfwdError(
-                'Bad log rotation criteria: %s' % sys.exc_info()[1]
+                'Failure configure logging: %s' % sys.exc_info()[1]
             )
 
         handler.setFormatter(logging.Formatter('%(message)s'))

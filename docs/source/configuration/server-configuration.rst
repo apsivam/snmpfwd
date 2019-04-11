@@ -114,7 +114,7 @@ Recognized OID prefixes are:
 
 Any integer value can serve as OID suffix.
 
-Example:
+Examples:
 
 .. code-block:: bash
 
@@ -122,7 +122,15 @@ Example:
     snmp-bind-address: 127.0.0.1:5555
 
 Where *1.3.6.1.6.1.1* identifies UDP-over-IPv4 transport and *123* identifies
-transport endpoint listening at address 127.0.0.1, UDP port 5555.
+transport endpoint listening at IPv4 address 127.0.0.1, UDP port 5555.
+
+.. code-block:: bash
+
+    snmp-transport-domain: 1.3.6.1.2.1.100.1.2.123
+    snmp-bind-address: [::1]:5555
+
+Here *1.3.6.1.2.1.100.1.2* identifies UDP-over-IPv6 transport and *123* identifies
+transport endpoint listening at IPv6 address ::1, UDP port 5555.
 
 .. _snmp-transport-options-server-option:
 
@@ -211,14 +219,13 @@ Identifier that logically groups SNMP configuration settings together.
 +++++++++++++++++++++++++
 
 The authoritative (security) SNMPv3 Engine ID to use when receiving SNMPv3
-messages from SNMP peers. For most cases it is not necessary to specify
-this engine ID, as it will usually be  discovered automatically.
+messages from SNMP peers. For receiving SNMP Commands, it is not necessary to
+specify *snmp-security-engine-id* engine ID, as *snmp-engine-id* might suffice.
 
-.. note::
-
-   It is absolutely essential to configure *snmp-security-engine-id* when
-   receiving SNMPv3 TRAP notifications. The reason is that TRAP is a
-   unidirectional message, that makes SNMP engine ID autodiscovery impossible.
+However, it is absolutely essential to configure *snmp-security-engine-id*
+matching SNMP engine ID of the SNMP entity sending SNMPv3 TRAP (known as
+*authoritative* SNMP engine). The reason is that TRAP is a unidirectional
+message what makes automatic SNMP engine ID discovery impossible.
 
 Example:
 
@@ -227,6 +234,11 @@ Example:
     {
         snmp-security-engine-id: 0x0102030405070809
     }
+
+.. warning::
+
+   SNMPv3 TRAP reception will not work unless SNMP engine ID of the
+   authoritative SNMP engine is configured as *snmp-security-engine-id*.
 
 .. _snmp-community-name-server-option:
 
@@ -431,14 +443,15 @@ maintained for the purpose of relaying SNMP messages.
 *trunk-bind-address*
 ++++++++++++++++++++
 
-Local network endpoint address to bind trunk connection to.
+Local IPv4 or IPv6 network endpoint address to bind trunk connection to.
 
 .. _trunk-peer-address-server-option:
 
 *trunk-peer-address*
 ++++++++++++++++++++
 
-Remote network endpoint address to connect to when establishing trunk connection.
+Remote IPv4 or IPv6 network endpoint address to connect to when establishing
+trunk connection.
 
 .. _trunk-ping-period-server-option:
 
@@ -497,15 +510,15 @@ clients.
     trunking-group {
       trunk-crypto-key: 1234567890
 
-      host-A {
-        trunk-bind-address: 127.0.0.1
-        trunk-peer-address: 127.0.0.1:30301
+      connect-over-ipv6 {
+        trunk-bind-address: [::1]
+        trunk-peer-address: [::1]:30301
         trunk-connection-mode: client
 
         trunk-id: servertrunk
       }
 
-      interface-1 {
+      listen-on-ipv4 {
         trunk-bind-address: 127.0.0.1:30201
         trunk-connection-mode: server
 

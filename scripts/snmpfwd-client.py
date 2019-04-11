@@ -2,7 +2,7 @@
 #
 # This file is part of snmpfwd software.
 #
-# Copyright (c) 2014-2018, Ilya Etingof <etingof@gmail.com>
+# Copyright (c) 2014-2019, Ilya Etingof <etingof@gmail.com>
 # License: http://snmplabs.com/snmpfwd/license.html
 #
 import os
@@ -32,10 +32,11 @@ from pyasn1 import debug as pyasn1_debug
 from pysnmp import debug as pysnmp_debug
 from snmpfwd import macro
 from snmpfwd.error import SnmpfwdError
-from snmpfwd import log, daemon, cparser
+from snmpfwd import log, daemon, cparser, endpoint
 from snmpfwd.plugins.manager import PluginManager
 from snmpfwd.plugins import status
 from snmpfwd.trunking.manager import TrunkingManager
+from snmpfwd.trunking.endpoint import parseTrunkEndpoint
 from snmpfwd.lazylog import LazyLogString
 
 # Settings
@@ -179,7 +180,13 @@ def main():
 
             if endpoints:
                 peerAddr, bindAddr = endpoints.pop(), endpoints.pop()
-                addrInfo[1] = addrInfo[1].__class__(peerAddr).setLocalAddress(bindAddr)
+
+                try:
+                    addrInfo[1] = addrInfo[1].__class__(peerAddr).setLocalAddress(bindAddr)
+
+                except Exception:
+                    raise PySnmpError('failure replacing bind address %s -> %s for transport '
+                                      'domain %s' % (addrInfo[1], bindAddr, addrInfo[0]))
 
             return addrInfo
 
@@ -337,7 +344,7 @@ def main():
 
                     except PySnmpError:
                         errorIndication = 'failure sending SNMP notification'
-                        log.error(errorIndication, ctx=logCtx)
+                        log.error('trunk message #%s, SNMP error: %s' % (msgId, sys.exc_info()[1]), ctx=logCtx)
 
                     else:
                         errorIndication = None
@@ -360,7 +367,7 @@ def main():
                         snmpMessageSent = True
 
                     except PySnmpError:
-                        log.error('failure sending SNMP notification', ctx=logCtx)
+                        log.error('trunk message #%s, SNMP error: %s' % (msgId, sys.exc_info()[1]), ctx=logCtx)
 
             elif pdu.tagSet not in rfc3411.unconfirmedClassPDUs:
                 try:
@@ -378,7 +385,7 @@ def main():
 
                 except PySnmpError:
                     errorIndication = 'failure sending SNMP command'
-                    log.error(errorIndication, ctx=logCtx)
+                    log.error('trunk message #%s, SNMP error: %s' % (msgId, sys.exc_info()[1]), ctx=logCtx)
 
                     # respond to trunk right away
                     snmpCbFun(snmpEngine, None, errorIndication, None, cbCtx)
@@ -405,8 +412,8 @@ Usage: %s [--help]
     [--log-level=<%s>]
     [--config-file=<file>]""" % (
             sys.argv[0],
-            '|'.join([x for x in pysnmp_debug.flagMap.keys() if x != 'mibview']),
-            '|'.join([x for x in pyasn1_debug.flagMap.keys()]),
+            '|'.join([x for x in getattr(pysnmp_debug, 'FLAG_MAP', getattr(pysnmp_debug, 'flagMap', ())) if x != 'mibview']),
+            '|'.join([x for x in getattr(pyasn1_debug, 'FLAG_MAP', getattr(pyasn1_debug, 'flagMap', ()))]),
             '|'.join(log.methodsMap),
             '|'.join(log.levelsMap)
         )
@@ -481,15 +488,17 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
         elif opt[0] == '--config-file':
             cfgFile = opt[1]
 
-    try:
-        log.setLogger(PROGRAM_NAME, *loggingMethod, **dict(force=True))
+    with daemon.PrivilegesOf(procUser, procGroup):
 
-        if loggingLevel:
-            log.setLevel(loggingLevel)
+        try:
+            log.setLogger(PROGRAM_NAME, *loggingMethod, **dict(force=True))
 
-    except SnmpfwdError:
-        sys.stderr.write('%s\r\n%s\r\n' % (sys.exc_info()[1], helpMessage))
-        return
+            if loggingLevel:
+                log.setLevel(loggingLevel)
+
+        except SnmpfwdError:
+            sys.stderr.write('%s\r\n%s\r\n' % (sys.exc_info()[1], helpMessage))
+            return
 
     try:
         cfgTree = cparser.Config().load(cfgFile)
@@ -546,12 +555,14 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
 
         log.info('configuring plugin ID %s (at %s) from module %s with options %s...' % (pluginId, '.'.join(pluginCfgPath), pluginMod, ', '.join(pluginOptions) or '<none>'))
 
-        try:
-            pluginManager.loadPlugin(pluginId, pluginMod, pluginOptions)
+        with daemon.PrivilegesOf(procUser, procGroup):
 
-        except SnmpfwdError:
-            log.error('plugin %s not loaded: %s' % (pluginId, sys.exc_info()[1]))
-            return
+            try:
+                pluginManager.loadPlugin(pluginId, pluginMod, pluginOptions)
+
+            except SnmpfwdError:
+                log.error('plugin %s not loaded: %s' % (pluginId, sys.exc_info()[1]))
+                return
 
     for peerEntryPath in cfgTree.getPathsToAttr('snmp-peer-id'):
         peerId = cfgTree.getAttrValue('snmp-peer-id', *peerEntryPath)
@@ -578,51 +589,35 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
 
             log.info('new engine-id %s' % snmpEngine.snmpEngineID.prettyPrint())
 
-        transportOptions = cfgTree.getAttrValue('snmp-transport-options', *peerEntryPath, **dict(default=[], vector=True))
-
-        bindAddrMacro = None
-        bindAddr = cfgTree.getAttrValue('snmp-bind-address', *peerEntryPath)
-
-        if 'transparent-proxy' in transportOptions or 'virtual-interface' in transportOptions:
-            if '$' in bindAddr:
-                bindAddrMacro = bindAddr
-                bindAddr = '0.0.0.0', 0
-            else:
-                try:
-                    if ':' in bindAddr:
-                        bindAddr = bindAddr.split(':', 1)
-                        bindAddr = bindAddr[0], int(bindAddr[1])
-                    else:
-                        bindAddr = bindAddr, 0
-
-                except (ValueError, IndexError):
-                    log.error('bad snmp-bind-address specification %s at %s' % (bindAddr, '.'.join(peerEntryPath)))
-                    return
-        else:
-            try:
-                if ':' in bindAddr:
-                    bindAddr = bindAddr.split(':', 1)
-                    bindAddr = bindAddr[0], int(bindAddr[1])
-                else:
-                    bindAddr = bindAddr, 0
-
-            except (ValueError, IndexError):
-                log.error('bad snmp-bind-address specification %s at %s' % (bindAddr, '.'.join(peerEntryPath)))
-                exit(-1)
-
         transportDomain = cfgTree.getAttrValue('snmp-transport-domain', *peerEntryPath)
         transportDomain = rfc1902.ObjectName(str(transportDomain))
 
+        if (transportDomain[:len(udp.domainName)] != udp.domainName and
+                udp6 and transportDomain[:len(udp6.domainName)] != udp6.domainName):
+            log.error('unknown transport domain %s' % (transportDomain,))
+            return
+
+        transportOptions = cfgTree.getAttrValue('snmp-transport-options', *peerEntryPath,
+                                                **dict(default=[], vector=True))
+
+        bindAddr = cfgTree.getAttrValue('snmp-bind-address', *peerEntryPath)
+
+        try:
+            bindAddr, bindAddrMacro = endpoint.parseTransportAddress(transportDomain, bindAddr,
+                                                                     transportOptions)
+
+        except SnmpfwdError:
+            log.error('bad snmp-bind-address specification %s at %s' % (bindAddr, '.'.join(peerEntryPath)))
+            return
+
         if transportDomain in snmpEngineMap['transportDomain']:
             log.info('using transport endpoint with transport ID %s' % (transportDomain,))
+
         else:
             if transportDomain[:len(udp.domainName)] == udp.domainName:
                 transport = udp.UdpTransport()
-            elif transportDomain[:len(udp6.domainName)] == udp6.domainName:
-                transport = udp6.Udp6Transport()
             else:
-                log.error('unknown transport domain %s' % (transportDomain,))
-                return
+                transport = udp6.Udp6Transport()
 
             snmpEngine.registerTransportDispatcher(
                 transportDispatcher, transportDomain
@@ -639,7 +634,7 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
             config.addSocketTransport(snmpEngine, transportDomain, t)
 
             snmpEngineMap['transportDomain'][transportDomain] = bindAddr[0], bindAddr[1], transportDomain
-            log.info('new transport endpoint at bind address %s:%s, options %s, transport ID %s' % (bindAddr[0], bindAddr[1], transportOptions and '/'.join(transportOptions) or '<none>', transportDomain))
+            log.info('new transport endpoint at bind address [%s]:%s, options %s, transport ID %s' % (bindAddr[0], bindAddr[1], transportOptions and '/'.join(transportOptions) or '<none>', transportDomain))
 
         securityModel = cfgTree.getAttrValue('snmp-security-model', *peerEntryPath)
         securityModel = rfc1902.Integer(securityModel)
@@ -656,7 +651,7 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
                     log.info('using security-name %s' % securityName)
                 else:
                     log.error('security-name %s already in use at security-model %s' % (securityName, securityModel))
-                    sys.exit(1)
+                    return
             else:
                 communityName = cfgTree.getAttrValue('snmp-community-name', *peerEntryPath)
                 config.addV1System(snmpEngine, securityName, communityName,
@@ -673,9 +668,14 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
                     raise SnmpfwdError('security-name %s already in use at security-model %s' % (securityName, securityModel))
             else:
                 usmUser = cfgTree.getAttrValue('snmp-usm-user', *peerEntryPath)
+                securityEngineId = cfgTree.getAttrValue('snmp-security-engine-id', *peerEntryPath,
+                                                        **dict(default=None))
+                if securityEngineId:
+                    securityEngineId = rfc1902.OctetString(securityEngineId)
 
                 log.info('new USM user %s, security-model %s, security-level %s, '
-                         'security-name %s' % (usmUser, securityModel, securityLevel, securityName))
+                         'security-name %s, security-engine-id %s' % (usmUser, securityModel, securityLevel,
+                                                                      securityName, securityEngineId and securityEngineId.prettyPrint() or '<none>'))
 
                 if securityLevel in (2, 3):
                     usmAuthProto = cfgTree.getAttrValue('snmp-usm-auth-protocol', *peerEntryPath, **dict(default=config.usmHMACMD5AuthProtocol))
@@ -728,27 +728,15 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
             log.info('new credentials %s, security-name %s, security-level %s, security-model %s' % (credId, securityName, securityLevel, securityModel))
             snmpEngineMap['credIds'].add(credId)
 
-        peerAddrMacro = None
         peerAddr = cfgTree.getAttrValue('snmp-peer-address', *peerEntryPath)
 
-        if 'transparent-proxy' in transportOptions or 'virtual-interface' in transportOptions:
-            if '$' in peerAddr:
-                peerAddrMacro = peerAddr
-                peerAddr = '0.0.0.0', 0
-            else:
-                try:
-                    peerAddr = peerAddr.split(':', 1)
-                    peerAddr = peerAddr[0], int(peerAddr[1])
-                except (ValueError, IndexError):
-                    log.error('bad snmp-peer-address specification %s at %s' % (peerAddr, '.'.join(peerEntryPath)))
-                    return
-        else:
-            try:
-                peerAddr = peerAddr.split(':', 1)
-                peerAddr = peerAddr[0], int(peerAddr[1])
-            except (ValueError, IndexError):
-                log.error('bad snmp-peer-address specification %s at %s' % (peerAddr, '.'.join(peerEntryPath)))
-                return
+        try:
+            peerAddr, peerAddrMacro = endpoint.parseTransportAddress(transportDomain, peerAddr,
+                                                                     transportOptions, defaultPort=161)
+
+        except SnmpfwdError:
+            log.error('bad snmp-peer-address specification %s at %s' % (peerAddr, '.'.join(peerEntryPath)))
+            return
 
         timeout = cfgTree.getAttrValue('snmp-peer-timeout', *peerEntryPath)
         retries = cfgTree.getAttrValue('snmp-peer-retries', *peerEntryPath)
@@ -852,16 +840,7 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
 
                         routingMap[k] = peerIdList
 
-
-
     trunkingManager = TrunkingManager(trunkCbFun)
-
-    def getTrunkAddr(a, port=0):
-        f = lambda h, p=port: (h, int(p))
-        try:
-            return f(*a.split(':'))
-        except Exception:
-            raise SnmpfwdError('improper IPv4 endpoint %s' % a)
 
     for trunkCfgPath in cfgTree.getPathsToAttr('trunk-id'):
         trunkId = cfgTree.getAttrValue('trunk-id', *trunkCfgPath)
@@ -872,15 +851,15 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
         if connectionMode == 'client':
             trunkingManager.addClient(
                 trunkId,
-                getTrunkAddr(cfgTree.getAttrValue('trunk-bind-address', *trunkCfgPath)),
-                getTrunkAddr(cfgTree.getAttrValue('trunk-peer-address', *trunkCfgPath), 30201),
+                parseTrunkEndpoint(cfgTree.getAttrValue('trunk-bind-address', *trunkCfgPath)),
+                parseTrunkEndpoint(cfgTree.getAttrValue('trunk-peer-address', *trunkCfgPath), 30201),
                 cfgTree.getAttrValue('trunk-ping-period', *trunkCfgPath, default=0, expect=int),
                 secret
             )
             log.info('new trunking client from %s to %s' % (cfgTree.getAttrValue('trunk-bind-address', *trunkCfgPath), cfgTree.getAttrValue('trunk-peer-address', *trunkCfgPath)))
         if connectionMode == 'server':
             trunkingManager.addServer(
-                getTrunkAddr(cfgTree.getAttrValue('trunk-bind-address', *trunkCfgPath), 30201),
+                parseTrunkEndpoint(cfgTree.getAttrValue('trunk-bind-address', *trunkCfgPath), 30201),
                 cfgTree.getAttrValue('trunk-ping-period', *trunkCfgPath, default=0, expect=int),
                 secret
             )
@@ -892,13 +871,6 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
     transportDispatcher.registerTimerCbFun(
         trunkingManager.monitorTrunks, random.randrange(1, 5)
     )
-
-    try:
-        daemon.dropPrivileges(procUser, procGroup)
-
-    except Exception:
-        log.error('can not drop privileges: %s' % sys.exc_info()[1])
-        return
 
     if not foregroundFlag:
         try:
@@ -916,17 +888,19 @@ Software documentation and support at http://snmplabs.com/snmpfwd/
 
     # Python 2.4 does not support the "finally" clause
 
-    while True:
-        try:
-            transportDispatcher.runDispatcher()
+    with daemon.PrivilegesOf(procUser, procGroup, final=True):
 
-        except (PySnmpError, SnmpfwdError, socket.error):
-            log.error(str(sys.exc_info()[1]))
-            continue
+        while True:
+            try:
+                transportDispatcher.runDispatcher()
 
-        except Exception:
-            transportDispatcher.closeDispatcher()
-            raise
+            except (PySnmpError, SnmpfwdError, socket.error):
+                log.error(str(sys.exc_info()[1]))
+                continue
+
+            except Exception:
+                transportDispatcher.closeDispatcher()
+                raise
 
 
 if __name__ == '__main__':
